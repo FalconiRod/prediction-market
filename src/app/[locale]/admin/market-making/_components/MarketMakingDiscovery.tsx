@@ -1,6 +1,6 @@
 'use client'
 
-import { useAppKit, useAppKitAccount } from '@reown/appkit/react'
+import { useAppKit, useAppKitAccount, useAppKitProvider } from '@reown/appkit/react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertTriangleIcon,
@@ -19,7 +19,7 @@ import {
   XIcon,
 } from 'lucide-react'
 import { useDeferredValue, useEffect, useMemo, useState } from 'react'
-import { erc20Abi } from 'viem'
+import { createWalletClient, custom, erc20Abi } from 'viem'
 import { usePublicClient, useWalletClient } from 'wagmi'
 
 import type { MarketMakingCampaignsCopy } from '@/app/[locale]/admin/market-making/_components/MarketMakingCampaigns'
@@ -46,7 +46,16 @@ import { usePublicRuntimeConfig } from '@/hooks/usePublicRuntimeConfig'
 import { COLLATERAL_TOKEN_ADDRESS, MARKET_MAKER_ESCROW_ADDRESS, POLY_SYNCER_CREATOR_ADDRESS } from '@/lib/contracts'
 import { MARKET_MAKER_ESCROW_ABI } from '@/lib/market-maker-escrow'
 import { cn } from '@/lib/utils'
+import { resolveViemNetworkByChainId } from '@/lib/viem-network'
 import { isRecoverableWalletConnectorError, isUserRejectedRequestError } from '@/lib/wallet'
+
+interface RpcWalletProvider {
+  request: (args: { method: string; params?: unknown[] | object }) => Promise<unknown>
+}
+
+function isRpcWalletProvider(value: unknown): value is RpcWalletProvider {
+  return Boolean(value) && typeof value === 'object' && typeof (value as { request?: unknown }).request === 'function'
+}
 
 interface MarketMakingCopy {
   eyebrow: string
@@ -96,6 +105,8 @@ interface MarketMakingCopy {
   campaignCreated: string
   transactionRejected: string
   insufficientBalance: string
+  balanceUnavailable: string
+  retry: string
   walletNotReady: string
   transactionFailed: string
   marketClosesTooSoon: string
@@ -130,6 +141,7 @@ interface EscrowPricingBreakdown {
   marketMakerReward: string
   protocolFee: string
   total: string
+  totalAtomic: string
 }
 
 interface EscrowPreviewResponse {
@@ -809,11 +821,29 @@ function CampaignDialog({
   const isMobile = useIsMobile()
   const { open: openAppKit } = useAppKit()
   const { address, isConnected } = useAppKitAccount()
+  const { walletProvider } = useAppKitProvider<RpcWalletProvider>('eip155')
   const { chainId, escrowUrl } = usePublicRuntimeConfig()
   const { data: walletClient } = useWalletClient()
   const publicClient = usePublicClient({ chainId })
   const queryClient = useQueryClient()
   const escrowBaseUrl = escrowUrl.replace(/\/+$/, '')
+  const transactionWalletClient = useMemo(() => {
+    if (!address) {
+      return null
+    }
+    if (walletClient?.account?.address?.toLowerCase() === address.toLowerCase()) {
+      return walletClient
+    }
+    const chain = resolveViemNetworkByChainId(chainId)
+    if (!chain || !isRpcWalletProvider(walletProvider)) {
+      return null
+    }
+    return createWalletClient({
+      account: address as `0x${string}`,
+      chain,
+      transport: custom(walletProvider),
+    })
+  }, [address, chainId, walletClient, walletProvider])
   const marketEndDate = getMarketEndDate(item)
   const initialServiceEnd = marketEndDate
   const quoteConditionIds = useMemo(
@@ -903,6 +933,38 @@ function CampaignDialog({
   const displayedTotal = breakdown
     ? Number(breakdown.total) + Number(effectiveImportFeeAtomic) / Number(USDC_ATOMIC_SCALE)
     : null
+  const importPaymentRequired =
+    item.needsDeployment &&
+    !pendingImportPaymentHash &&
+    (!importValue || importValue.state === 'awaiting_payment' || importValue.state === 'expired')
+  const requiredBalanceAtomic = breakdown
+    ? BigInt(breakdown.totalAtomic) + (importPaymentRequired ? effectiveImportFeeAtomic : 0n)
+    : null
+  const sponsorBalanceQuery = useQuery({
+    queryKey: ['market-making-sponsor-usdc-balance', chainId, address?.toLowerCase()],
+    enabled: open && Boolean(address && publicClient),
+    staleTime: 5_000,
+    refetchInterval: 10_000,
+    retry: false,
+    queryFn: async () => {
+      if (!address || !publicClient) {
+        throw new Error('Sponsor wallet is not available.')
+      }
+      return publicClient.readContract({
+        address: COLLATERAL_TOKEN_ADDRESS,
+        abi: erc20Abi,
+        functionName: 'balanceOf',
+        args: [address as `0x${string}`],
+      })
+    },
+  })
+  const isSponsorBalanceLoading =
+    Boolean(address && publicClient) &&
+    (sponsorBalanceQuery.isLoading || (sponsorBalanceQuery.data === undefined && sponsorBalanceQuery.isFetching))
+  const hasInsufficientSponsorBalance =
+    requiredBalanceAtomic !== null &&
+    sponsorBalanceQuery.data !== undefined &&
+    sponsorBalanceQuery.data < requiredBalanceAtomic
 
   useEffect(() => {
     if (!open || !item.needsDeployment || !importStorageKey) {
@@ -992,8 +1054,11 @@ function CampaignDialog({
     if (quoteConditionIds.length !== item.markets.length || preview?.status !== 'priced') {
       return
     }
-    if (!walletClient || !publicClient) {
+    if (!transactionWalletClient || !publicClient) {
       setIssueError(copy.walletNotReady)
+      return
+    }
+    if (isSponsorBalanceLoading || sponsorBalanceQuery.isError || hasInsufficientSponsorBalance) {
       return
     }
 
@@ -1050,18 +1115,18 @@ function CampaignDialog({
           ) {
             throw new Error(copy.quoteUnavailable)
           }
-          if ((await walletClient.getChainId()) !== chainId) {
-            await walletClient.switchChain({ id: chainId })
+          if ((await transactionWalletClient.getChainId()) !== chainId) {
+            await transactionWalletClient.switchChain({ id: chainId })
           }
           const paymentHash =
             pendingImportPaymentHash ??
-            (await walletClient.writeContract({
+            (await transactionWalletClient.writeContract({
               account: address as `0x${string}`,
               address: activeImport.payment.tokenAddress as `0x${string}`,
               abi: erc20Abi,
               functionName: 'transfer',
               args: [activeImport.payment.receiverAddress as `0x${string}`, BigInt(activeImport.payment.amountAtomic)],
-              chain: walletClient.chain,
+              chain: transactionWalletClient.chain,
             }))
           setPendingImportPaymentHash(paymentHash)
           if (importPaymentStorageKey) {
@@ -1131,10 +1196,10 @@ function CampaignDialog({
       }
       setIssuedQuote(issued)
 
-      if ((await walletClient.getChainId()) !== chainId) {
-        await walletClient.switchChain({ id: chainId })
+      if ((await transactionWalletClient.getChainId()) !== chainId) {
+        await transactionWalletClient.switchChain({ id: chainId })
       }
-      if ((await walletClient.getChainId()) !== chainId) {
+      if ((await transactionWalletClient.getChainId()) !== chainId) {
         throw new Error(copy.quoteUnavailable)
       }
 
@@ -1148,13 +1213,13 @@ function CampaignDialog({
         args: [sponsor, MARKET_MAKER_ESCROW_ADDRESS],
       })
       if (allowance < requiredAllowance) {
-        const approvalHash = await walletClient.writeContract({
+        const approvalHash = await transactionWalletClient.writeContract({
           account: sponsor,
           address: COLLATERAL_TOKEN_ADDRESS,
           abi: erc20Abi,
           functionName: 'approve',
           args: [MARKET_MAKER_ESCROW_ADDRESS, requiredAllowance],
-          chain: walletClient.chain,
+          chain: transactionWalletClient.chain,
         })
         const approvalReceipt = await publicClient.waitForTransactionReceipt({ hash: approvalHash })
         if (approvalReceipt.status !== 'success') {
@@ -1163,7 +1228,7 @@ function CampaignDialog({
       }
 
       const quote = issued.quote
-      const campaignHash = await walletClient.writeContract({
+      const campaignHash = await transactionWalletClient.writeContract({
         account: sponsor,
         address: MARKET_MAKER_ESCROW_ADDRESS,
         abi: MARKET_MAKER_ESCROW_ABI,
@@ -1185,7 +1250,7 @@ function CampaignDialog({
           },
           issued.signature as `0x${string}`,
         ],
-        chain: walletClient.chain,
+        chain: transactionWalletClient.chain,
       })
       const campaignReceipt = await publicClient.waitForTransactionReceipt({ hash: campaignHash })
       if (campaignReceipt.status !== 'success') {
@@ -1428,6 +1493,27 @@ function CampaignDialog({
       </div>
 
       <div className="shrink-0 border-t bg-background px-4 py-3 sm:px-5">
+        {hasInsufficientSponsorBalance && (
+          <div className="mb-3 flex items-center justify-center gap-2 rounded-lg border border-orange-500/30 bg-orange-500/5 px-3 py-2 text-center text-sm font-semibold text-orange-500">
+            <AlertTriangleIcon className="size-4 shrink-0" aria-hidden />
+            {copy.insufficientBalance}
+          </div>
+        )}
+        {sponsorBalanceQuery.isError && (
+          <div className="mb-3 flex items-center justify-center gap-2 rounded-lg border border-orange-500/30 bg-orange-500/5 px-3 py-2 text-center text-sm font-semibold text-orange-500">
+            <AlertTriangleIcon className="size-4 shrink-0" aria-hidden />
+            <span>{copy.balanceUnavailable}</span>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={sponsorBalanceQuery.isFetching}
+              onClick={() => void sponsorBalanceQuery.refetch()}
+            >
+              {copy.retry}
+            </Button>
+          </div>
+        )}
         <p className="mb-2 hidden overflow-hidden text-center text-xs text-ellipsis whitespace-nowrap text-muted-foreground sm:block">
           {copy.escrowNotice}
         </p>
@@ -1437,7 +1523,14 @@ function CampaignDialog({
           className="w-full"
           disabled={
             isIssuing ||
-            (isConnected && (preview?.status !== 'priced' || previewQuery.isLoading || previewQuery.isFetching))
+            (isConnected &&
+              (preview?.status !== 'priced' ||
+                previewQuery.isLoading ||
+                previewQuery.isFetching ||
+                !transactionWalletClient ||
+                isSponsorBalanceLoading ||
+                sponsorBalanceQuery.isError ||
+                hasInsufficientSponsorBalance))
           }
           onClick={handleFundCampaign}
         >
@@ -1546,7 +1639,7 @@ export default function MarketMakingDiscovery({
   })
 
   return (
-    <section className="min-w-0">
+    <section className="min-h-[calc(100dvh-6rem)] min-w-0">
       <Tabs defaultValue="sponsor">
         <TabsList className="h-10">
           <TabsTrigger value="sponsor" className="h-8 px-5">

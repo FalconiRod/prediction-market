@@ -862,7 +862,7 @@ export default function MarketMakingCampaigns({ locale, copy }: Props) {
         </div>
         <Select value={filter} onValueChange={(value) => value && setFilter(value as EscrowCampaignStatusFilter)}>
           <SelectTrigger className="w-36 sm:w-44">
-            <SelectValue />
+            <SelectValue>{filters.find((item) => item.id === filter)?.label ?? copy.all}</SelectValue>
           </SelectTrigger>
           <SelectContent align="end">
             {filters.map((item) => (

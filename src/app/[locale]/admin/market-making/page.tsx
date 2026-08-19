@@ -62,6 +62,8 @@ export default async function AdminMarketMakingPage() {
         campaignCreated: t('Campaign created.'),
         transactionRejected: t('You rejected the transaction.'),
         insufficientBalance: t('Insufficient USDC balance'),
+        balanceUnavailable: t('Could not validate USDC balance right now.'),
+        retry: t('Retry'),
         walletNotReady: t('Wallet is not ready. Please try again.'),
         transactionFailed: t('The transaction could not be completed.'),
         marketClosesTooSoon: t('This market closes too soon for the minimum sponsorship period.'),
